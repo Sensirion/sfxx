@@ -1,6 +1,6 @@
 /* Sensirion SFxx flow and differential pressure sensor driver.
- * Currently, the SF04 chip is supported. This chip is used in several
- * mass flow meters and differential pressure sensors.
+ * Currently, the SF04 and SF05 chips are supported. These chips are used
+ * in several mass flow meters and differential pressure sensors.
  *
  * Copyright (C) 2015 Sensirion AG, Switzerland
  * Author: David Frey <david.frey@sensirion.com>
@@ -28,46 +28,75 @@
 
 #include "sfxx.h"
 
-#define SF04_CMD_LENGTH      1
-#define SF04_CRC8_LEN        1
-#define SF04_CRC8_POLYNOMIAL 0x31
-#define SF04_CRC8_INIT       0x00
+#define SFXX_CMD_LENGTH      2
+#define SFXX_CRC8_POLYNOMIAL 0x31
+#define SFXX_CRC8_INIT       0x00
 #define SFXX_RESPONSE_LENGTH 3
 #define SFXX_WORD_LENGTH     2
 #define SFXX_ADDRESS_LENGTH  2
+#define SFXX_SILICON_ID_MASK 0x1f
 
 DECLARE_CRC8_TABLE(sfxx_crc8_table);
 
-#define SFXX_NAME   "sfxx"
-#define SDP6XX_NAME "sdp6xx"
-#define SDP631_NAME "sdp631"
+#define SFXX_NAME    "sfxx"
+#define SF04_NAME    "sf04"
+#define SF05_NAME    "sf05"
+#define SDP6XX_NAME  "sdp6xx"
+#define SDP631_NAME  "sdp631"
+#define SFM3500_NAME "sfm3500"
 
 enum DEVICE_ID {
 	SFXX_ID,
+	SF04_ID,
+	SF05_ID,
 	SDP6XX_ID,
 	SDP631_ID,
+	SFM3500_ID,
 };
 
 /* commands */
 struct sfxx_commands {
-	const u8 measure[SF04_CMD_LENGTH];
-	const u8 read_eeprom[SF04_CMD_LENGTH];
-	const u8 read_id_reg[SF04_CMD_LENGTH];
+	const u8 *measure;
+	const u8 *read_eeprom;
+	const u8 *read_id_reg;
 	u8 length;
+
+	u16 addr_scale_factor;
+	u16 addr_offset;
+	u16 addr_flow_unit;
+	u8 silicon_id;
 };
+
+static const u8 sf04_command_measure[]     = { 0xf1 };
+static const u8 sf04_command_read_eeprom[] = { 0xfa };
+static const u8 sf04_command_read_id_reg[] = { 0xef };
 
 static const struct sfxx_commands sf04_commands = {
-	.measure    = { 0xf1 },
-	.read_eeprom = { 0xFA },
-	.read_id_reg = { 0xef },
-	.length = SF04_CMD_LENGTH,
+	.measure     = sf04_command_measure,
+	.read_eeprom = sf04_command_read_eeprom,
+	.read_id_reg = sf04_command_read_id_reg,
+	.length      = 1,
+
+	.addr_scale_factor = 0x02b6,
+	.addr_offset       = 0x02be,
+	.addr_flow_unit    = 0x02b7,
+	.silicon_id  = 3,
 };
 
-/* addresses */
-static const u16 sf04_addr_scale_factor = 0x02b6;
-static const u16 sf04_addr_offset       = 0x02be;
-static const u16 sf04_addr_flow_unit    = 0x02b7;
+const u8 sf05_command_measure[]     = { 0x10, 0x00 };
+const u8 sf05_command_read_id_reg[] = { 0x77, 0x00 };
 
+static const struct sfxx_commands sf05_commands = {
+	.measure     = sf05_command_measure,
+	.read_eeprom = NULL,
+	.read_id_reg = sf05_command_read_id_reg,
+	.length      = 2,
+
+	.addr_scale_factor = 0x30de,
+	.addr_offset       = 0x30df,
+	.addr_flow_unit    = 0x31e1,
+	.silicon_id  = 5,
+};
 
 struct sfxx_data {
 	struct i2c_client *client;
@@ -78,9 +107,9 @@ struct sfxx_data {
 	const struct sfxx_commands *commands;
 	struct sfxx_platform_data setup;
 
-	s32 scale_factor;
-	s32 offset;		/* 16/16 fixed point */
 	s32 measured_value;	/* 16/16 fixed point */
+	s32 scale_factor;
+	u16 offset;
 	u16 unit;
 };
 
@@ -94,15 +123,15 @@ static int sfxx_read_from_command(struct i2c_client *client,
 
 	ret = i2c_master_send(client, command, length);
 	if (ret != length) {
-		dev_err(&client->dev, "failed to send command: %d\n", ret);
+		dev_err(&client->dev, "failed to send command: %d", ret);
 		return ret < 0 ? ret : -EIO;
 	}
 	ret = i2c_master_recv(client, buffer, SFXX_RESPONSE_LENGTH);
 	if (ret != SFXX_RESPONSE_LENGTH) {
-		dev_err(&client->dev, "failed to read values: %d\n", ret);
+		dev_err(&client->dev, "failed to read values: %d", ret);
 		return ret < 0 ? ret : -EIO;
 	}
-	crc = crc8(sfxx_crc8_table, buffer, SFXX_WORD_LENGTH, SF04_CRC8_INIT);
+	crc = crc8(sfxx_crc8_table, buffer, SFXX_WORD_LENGTH, SFXX_CRC8_INIT);
 	if (crc != buffer[2]) {
 		dev_err(&client->dev, "crc received: %x, calculated: %x",
 			(u32)buffer[2], (u32) crc);
@@ -135,7 +164,6 @@ static struct sfxx_data *sfxx_update_client(struct device *dev)
 	 */
 	value = (s32)((raw_value - data->offset) << 16) / data->scale_factor;
 	data->measured_value = value;
-
 	data->valid = true;
 
 out:
@@ -148,17 +176,21 @@ static int sfxx_read_eeprom_word(struct i2c_client *client,
 				 const struct sfxx_commands *commands,
 				 u16 address, u16 *value)
 {
-	u8 command[SF04_CMD_LENGTH + SFXX_ADDRESS_LENGTH];
-
-	memcpy(command, commands->read_eeprom, commands->length);
+	u8 command[SFXX_CMD_LENGTH + SFXX_ADDRESS_LENGTH];
+	size_t position = 0;
+	if (commands->read_eeprom != NULL) {
+		memcpy(command, commands->read_eeprom, commands->length);
+		position += commands->length;
+	}
 	address = cpu_to_be16(address);
-	memcpy(command + commands->length, &address, sizeof(address));
+	memcpy(command + position, &address, sizeof(address));
 	return sfxx_read_from_command(client, command,
-				      commands->length + SFXX_ADDRESS_LENGTH,
+				      position + sizeof(address),
 				      value);
 }
 
-static ssize_t print_fixed_point(char *buffer, s32 value) {
+static ssize_t print_fixed_point(char *buffer, s32 value)
+{
 	char sign[] = "\0\0";
 	if (value < 0) {
 		value = -value;
@@ -196,12 +228,12 @@ static ssize_t offset_show(struct device *dev,
 			   char *buffer)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
-	return sprintf(buffer, "%d\n", data->offset >> 16);
+	return sprintf(buffer, "%u\n", (unsigned)data->offset);
 }
 
 static ssize_t unit_show(struct device *dev,
-			   struct device_attribute *attr,
-			   char *buffer)
+			 struct device_attribute *attr,
+			 char *buffer)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
 	u8 position;
@@ -251,115 +283,143 @@ static const struct attribute_group sfxx_attr_group = {
 	.attrs = sfxx_attributes,
 };
 
-static void sfxx_select_commands(struct sfxx_data *data)
-{
-	data->commands = &sf04_commands;
-}
-
 static int read_details_from_eeprom(struct i2c_client *client,
-				    struct sfxx_data *data) {
+				    struct sfxx_data *data)
+{
 	int ret;
 	u16 word;
-	ret = sfxx_read_eeprom_word(client, &sf04_commands,
-				    sf04_addr_scale_factor, &word);
+	ret = sfxx_read_eeprom_word(client, data->commands,
+				    data->commands->addr_scale_factor, &word);
 	if (ret < 0) {
-		dev_err(&client->dev, "could not read scale factor: %d\n", ret);
+		dev_err(&client->dev, "could not read scale factor: %d", ret);
 		return ret;
 	}
 	data->scale_factor = word;
-	ret = sfxx_read_eeprom_word(client, &sf04_commands,
-				    sf04_addr_offset, &word);
+	ret = sfxx_read_eeprom_word(client, data->commands,
+				    data->commands->addr_offset, &word);
 	if (ret < 0) {
-		dev_err(&client->dev, "could not read offset: %d\n", ret);
+		dev_err(&client->dev, "could not read offset: %d", ret);
 		return ret;
 	}
-	data->offset = (s16)word << 16;
-	ret = sfxx_read_eeprom_word(client, &sf04_commands,
-				    sf04_addr_flow_unit, &word);
+	data->offset = word;
+	ret = sfxx_read_eeprom_word(client, data->commands,
+				    data->commands->addr_flow_unit, &word);
 	if (ret < 0) {
-		dev_err(&client->dev, "could not read scale factor: %d\n", ret);
+		dev_err(&client->dev, "could not read scale factor: %d", ret);
 		return ret;
 	}
 	data->unit = word;
 	return 0;
 }
 
+static int probe_for_sensor(struct i2c_client *client,
+			    const struct sfxx_commands *commands)
+{
+	u16 word;
+	int ret;
+	ret = sfxx_read_from_command(client, commands->read_id_reg,
+				     commands->length, &word);
+	if (ret < 0) {
+		dev_err(&client->dev, "could not read id register: %d", ret);
+		return ret;
+	}
+	if ((word & SFXX_SILICON_ID_MASK) != commands->silicon_id) {
+		dev_err(&client->dev, "connected device is not sfxx");
+		return -ENODEV;
+	}
+	return 0;
+}
+
 static int sfxx_probe(struct i2c_client *client,
-                       const struct i2c_device_id *id)
+		      const struct i2c_device_id *id)
 {
 	int ret;
-	u16 word;
 	struct sfxx_data *data;
 	struct i2c_adapter *adap = client->adapter;
 	struct device *dev = &client->dev;
+	enum DEVICE_ID device_id = (enum DEVICE_ID)id->driver_data;
+	const struct sfxx_commands *commands;
 
 	if (!i2c_check_functionality(adap, I2C_FUNC_I2C)) {
-		dev_err(dev, "plain i2c transactions not supported\n");
+		dev_err(dev, "plain i2c transactions not supported");
 		return -ENODEV;
 	}
 	/* has to be done before the first I2C communication */
-	crc8_populate_msb(sfxx_crc8_table, SF04_CRC8_POLYNOMIAL);
+	crc8_populate_msb(sfxx_crc8_table, SFXX_CRC8_POLYNOMIAL);
 
-	ret = sfxx_read_from_command(client, sf04_commands.read_id_reg,
-				     sf04_commands.length, &word);
-	if (ret < 0) {
-		dev_err(dev, "could not read id register: %d\n", ret);
-		return ret;
+	switch (device_id) {
+		case SFXX_ID:
+			dev_info(dev, "probing multiple chips, ignore error messages on success");
+			commands = &sf04_commands;
+			ret = probe_for_sensor(client, commands);
+			if (ret == 0)
+				break;
+			commands = &sf05_commands;
+			ret = probe_for_sensor(client, commands);
+			break;
+		case SF04_ID:
+		case SDP6XX_ID:
+		case SDP631_ID:
+			commands = &sf04_commands;
+			ret = probe_for_sensor(client, commands);
+			break;
+		case SF05_ID:
+		case SFM3500_ID:
+			commands = &sf05_commands;
+			ret = probe_for_sensor(client, commands);
+			break;
+		default:
+			dev_err(dev, "unknown device");
+			return -ENODEV;
 	}
-	if ((word & 0x1f) != 3) {
-		dev_err(dev, "connected device is not sf04\n");
-		return -ENODEV;
+	if (ret < 0) {
+		dev_err(dev, "probing for %s failed", id->name);
+		return ret;
 	}
 
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 	data->client = client;
+	data->commands = commands;
 
-	switch ((enum DEVICE_ID)id->driver_data) {
-		case SFXX_ID:
-		case SDP6XX_ID:
-			ret = read_details_from_eeprom(client, data);
-			break;
-		case SDP631_ID:
-			/* SDP631 does not have valid values in EEPROM */
-			data->scale_factor = 60;
-			data->offset = 0 << 16;
-			data->unit = 0x1008;
-			break;
-		default:
-			dev_err(dev, "unknown device\n");
-			return -ENODEV;
-	}
-	if (ret < 0) {
-		return ret;
+	if (device_id == SDP631_ID) {
+		/* SDP631 does not have valid values in EEPROM */
+		data->scale_factor = 60;
+		data->offset = 0;
+		data->unit = 0x1008;
+	} else {
+		ret = read_details_from_eeprom(client, data);
+		if (ret < 0)
+			return ret;
 	}
 
 	if (client->dev.platform_data)
 		data->setup = *(struct sfxx_platform_data *)dev->platform_data;
-	sfxx_select_commands(data);
 	mutex_init(&data->update_lock);
 
 	i2c_set_clientdata(client, data);
 
 	ret = sysfs_create_group(&client->dev.kobj, &sfxx_attr_group);
 	if (ret) {
-		dev_err(&client->dev, "Could not create sysfs group\n");
+		dev_err(&client->dev, "Could not create sysfs group");
 		return ret;
 	}
 
 	data->dev = input_allocate_device();
 	if (!data->dev || IS_ERR(data->dev)) {
-		dev_err(&client->dev, "Unable to allocate device data\n");
+		dev_err(&client->dev, "Unable to allocate device data");
 		ret = PTR_ERR(data->dev);
 		goto fail_remove_sysfs;
 	}
 	ret = input_register_device(data->dev);
 	if (ret) {
-		dev_err(&client->dev, "Unable to register device data\n");
+		dev_err(&client->dev, "Unable to register device data");
 		goto fail_remove_sysfs;
 	}
 
+	/* start the continuous measurement on the sensor */
+	sfxx_update_client(&client->dev);
 	return 0;
 
 fail_remove_sysfs:
@@ -381,8 +441,11 @@ static int __exit sfxx_remove(struct i2c_client *client)
 /* device ID table */
 static const struct i2c_device_id sfxx_id[] = {
 	{SFXX_NAME, SFXX_ID},
+	{SF04_NAME, SF04_ID},
+	{SF05_NAME, SF05_ID},
 	{SDP6XX_NAME, SDP6XX_ID},
 	{SDP631_NAME, SDP631_ID},
+	{SFM3500_NAME, SFM3500_ID},
 	{}
 };
 

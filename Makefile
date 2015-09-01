@@ -58,7 +58,7 @@ all: $(MODULEBINARY)
 load: $(MODULEBINARY)
 	scp $(MODULEBINARY) $(BOARD_ADDRESS):
 	ssh $(BOARD_ADDRESS) 'sudo insmod $(MODULEBINARY)'
-	ssh $(BOARD_ADDRESS) 'echo sdp631 $(ADDRESS) | sudo tee /sys/bus/i2c/devices/i2c-$(I2C_BUSID)/new_device'
+	ssh $(BOARD_ADDRESS) 'echo $(MODULENAME) $(ADDRESS) | sudo tee /sys/bus/i2c/devices/i2c-$(I2C_BUSID)/new_device'
 	@echo "\n driver loaded\n"
 
 unload:
