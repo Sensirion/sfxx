@@ -197,9 +197,9 @@ static ssize_t print_fixed_point(char *buffer, s32 value)
 	/* We separate the fixed point number into the decimal and the fraction
 	 * part for printing.
 	 */
-	return sprintf(buffer, "%s%d.%07u\n", sign,
-		       value >> 16,
-		       (value & 0xffff) * (10000000 / (1 << 16)));
+	return scnprintf(buffer, PAGE_SIZE, "%s%d.%07u\n", sign,
+			 value >> 16,
+			 (value & 0xffff) * (10000000 / (1 << 16)));
 }
 
 static ssize_t measured_value_show(struct device *dev,
@@ -218,7 +218,7 @@ static ssize_t scale_factor_show(struct device *dev,
 				 char *buffer)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
-	return sprintf(buffer, "%d\n", data->scale_factor);
+	return scnprintf(buffer, PAGE_SIZE, "%d\n", data->scale_factor);
 }
 
 static ssize_t offset_show(struct device *dev,
@@ -226,7 +226,7 @@ static ssize_t offset_show(struct device *dev,
 			   char *buffer)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
-	return sprintf(buffer, "%u\n", (unsigned)data->offset);
+	return scnprintf(buffer, PAGE_SIZE, "%u\n", (unsigned)data->offset);
 }
 
 static ssize_t unit_show(struct device *dev,
@@ -234,7 +234,7 @@ static ssize_t unit_show(struct device *dev,
 			 char *buffer)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
-	u8 position;
+	u8 p1, p2, p3;
 	/* the unit is encoded as three indexes into lists for prefix,
 	 * unit and time base.
 	 */
@@ -248,20 +248,14 @@ static ssize_t unit_show(struct device *dev,
 		"", "", "", "", "", "", "", "", "", "", "", ""
 	};
 	const char *time_base[] = {
-		"", "us", "ms", "s", "min", "h", "day", "", "", "", "",
+		"", "/us", "/ms", "/s", "/min", "/h", "/day", "", "", "", "",
 		"", "", "", "", ""
 	};
-	buffer[0] = '\0';
-	position = data->unit & 0x0f;
-	strcat(buffer, prefix[position]);
-	position = (data->unit >> 8) & 0x1f;
-	strcat(buffer, base_unit[position]);
-	position = (data->unit >> 4) & 0x0f;
-	if (time_base[position][0] != '\0') {
-		strcat(buffer, "/");
-		strcat(buffer, time_base[position]);
-	}
-	return strlen(buffer);
+	p1 = data->unit & 0x0f;
+	p2 = (data->unit >> 8) & 0x1f;
+	p3 = (data->unit >> 4) & 0x0f;
+	return scnprintf(buffer, PAGE_SIZE, "%s%s%s\n",
+			 prefix[p1], base_unit[p2], time_base[p3]);
 }
 
 static DEVICE_ATTR_RO(measured_value);
