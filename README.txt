@@ -34,9 +34,6 @@ sf04, sdp6xx:
 sf05, sfm3500:
       The driver will expect the SF05 sensor chip and will self configure
       according to the settings of the sensor.
-sdp631:
-      The driver will expect the SF04 sensor chip and will self configure
-      with the sensor settings according to the datasheet.
 
 sysfs-Interface
 ---------------

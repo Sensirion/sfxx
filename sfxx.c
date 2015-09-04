@@ -42,7 +42,6 @@ DECLARE_CRC8_TABLE(sfxx_crc8_table);
 #define SF04_NAME    "sf04"
 #define SF05_NAME    "sf05"
 #define SDP6XX_NAME  "sdp6xx"
-#define SDP631_NAME  "sdp631"
 #define SFM3500_NAME "sfm3500"
 
 enum DEVICE_ID {
@@ -50,7 +49,6 @@ enum DEVICE_ID {
 	SF04_ID,
 	SF05_ID,
 	SDP6XX_ID,
-	SDP631_ID,
 	SFM3500_ID,
 };
 
@@ -77,9 +75,9 @@ static const struct sfxx_commands sf04_commands = {
 	.read_id_reg = sf04_command_read_id_reg,
 	.length      = 1,
 
-	.addr_scale_factor = 0x02b6,
-	.addr_offset       = 0x02be,
-	.addr_flow_unit    = 0x02b7,
+	.addr_scale_factor = 0x2b60,
+	.addr_offset       = 0x2be0,
+	.addr_flow_unit    = 0x2b70,
 	.silicon_id  = 3,
 };
 
@@ -359,7 +357,6 @@ static int sfxx_probe(struct i2c_client *client,
 			break;
 		case SF04_ID:
 		case SDP6XX_ID:
-		case SDP631_ID:
 			commands = &sf04_commands;
 			ret = probe_for_sensor(client, commands);
 			break;
@@ -383,16 +380,9 @@ static int sfxx_probe(struct i2c_client *client,
 	data->client = client;
 	data->commands = commands;
 
-	if (device_id == SDP631_ID) {
-		/* SDP631 does not have valid values in EEPROM */
-		data->scale_factor = 60;
-		data->offset = 0;
-		data->unit = 0x1008;
-	} else {
-		ret = read_details_from_eeprom(client, data);
-		if (ret < 0)
-			return ret;
-	}
+	ret = read_details_from_eeprom(client, data);
+	if (ret < 0)
+		return ret;
 
 	if (client->dev.platform_data)
 		data->setup = *(struct sfxx_platform_data *)dev->platform_data;
@@ -444,7 +434,6 @@ static const struct i2c_device_id sfxx_id[] = {
 	{SF04_NAME, SF04_ID},
 	{SF05_NAME, SF05_ID},
 	{SDP6XX_NAME, SDP6XX_ID},
-	{SDP631_NAME, SDP631_ID},
 	{SFM3500_NAME, SFM3500_ID},
 	{}
 };
