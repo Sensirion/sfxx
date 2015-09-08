@@ -63,6 +63,7 @@ struct sfxx_commands {
 	u16 addr_offset;
 	u16 addr_flow_unit;
 	u8 silicon_id;
+	unsigned int warmup_time_ms;
 };
 
 static const u8 sf04_command_measure[]     = { 0xf1 };
@@ -79,6 +80,7 @@ static const struct sfxx_commands sf04_commands = {
 	.addr_offset       = 0x2be0,
 	.addr_flow_unit    = 0x2b70,
 	.silicon_id  = 3,
+	.warmup_time_ms = 0,
 };
 
 const u8 sf05_command_measure[]     = { 0x10, 0x00 };
@@ -94,13 +96,14 @@ static const struct sfxx_commands sf05_commands = {
 	.addr_offset       = 0x30df,
 	.addr_flow_unit    = 0x31e1,
 	.silicon_id  = 5,
+	.warmup_time_ms = 35,
 };
 
 struct sfxx_data {
 	struct i2c_client *client;
 	struct input_dev *dev;
 	struct mutex update_lock;
-	bool valid;
+	bool measurement_started;
 
 	const struct sfxx_commands *commands;
 	struct sfxx_platform_data setup;
@@ -111,19 +114,12 @@ struct sfxx_data {
 	u16 unit;
 };
 
-static int sfxx_read_from_command(struct i2c_client *client,
-				  const u8 *command, u16 length,
-				  u16 *value)
+static int sfxx_read_word(struct i2c_client *client, u16 *value)
 {
 	int ret;
-	u8 buffer[SFXX_RESPONSE_LENGTH];
 	u8 crc;
+	u8 buffer[SFXX_RESPONSE_LENGTH];
 
-	ret = i2c_master_send(client, command, length);
-	if (ret != length) {
-		dev_err(&client->dev, "failed to send command: %d", ret);
-		return ret < 0 ? ret : -EIO;
-	}
 	ret = i2c_master_recv(client, buffer, SFXX_RESPONSE_LENGTH);
 	if (ret != SFXX_RESPONSE_LENGTH) {
 		dev_err(&client->dev, "failed to read values: %d", ret);
@@ -139,6 +135,20 @@ static int sfxx_read_from_command(struct i2c_client *client,
 	return 0;
 }
 
+static int sfxx_read_from_command(struct i2c_client *client,
+				  const u8 *command, u16 length,
+				  u16 *value)
+{
+	int ret;
+
+	ret = i2c_master_send(client, command, length);
+	if (ret != length) {
+		dev_err(&client->dev, "failed to send command: %d", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+	return sfxx_read_word(client, value);
+}
+
 static struct sfxx_data *sfxx_update_client(struct device *dev)
 {
 	struct sfxx_data *data = dev_get_drvdata(dev);
@@ -148,11 +158,25 @@ static struct sfxx_data *sfxx_update_client(struct device *dev)
 	int ret;
 
 	mutex_lock(&data->update_lock);
+	if (!data->measurement_started) {
+		/* start the continuous measurement on the sensor */
+		ret = i2c_master_send(client, data->commands->measure,
+				      data->commands->length);
+		if (ret != data->commands->length) {
+			dev_err(&client->dev, "failed to start measurement: %d", ret);
+			ret = ret < 0 ? ret : -EIO;
+			goto out;
+		}
+		if (data->commands->warmup_time_ms > 0)
+			msleep(data->commands->warmup_time_ms);
+		data->measurement_started = true;
+	}
 
-	ret = sfxx_read_from_command(client, data->commands->measure,
-				     data->commands->length, &raw_value);
-	if (ret)
+	ret = sfxx_read_word(client, &raw_value);
+	if (ret) {
+		data->measurement_started = false;
 		goto out;
+	}
 
 	/*
 	 * From datasheet:
@@ -162,7 +186,6 @@ static struct sfxx_data *sfxx_update_client(struct device *dev)
 	 */
 	value = (s32)((raw_value - data->offset) << 16) / data->scale_factor;
 	data->measured_value = value;
-	data->valid = true;
 
 out:
 	mutex_unlock(&data->update_lock);
@@ -402,8 +425,6 @@ static int sfxx_probe(struct i2c_client *client,
 		goto fail_remove_sysfs;
 	}
 
-	/* start the continuous measurement on the sensor */
-	sfxx_update_client(&client->dev);
 	return 0;
 
 fail_remove_sysfs:
